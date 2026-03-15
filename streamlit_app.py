@@ -57,7 +57,7 @@ st.set_page_config(
 )
 
 SCRIPT_DIR    = Path(__file__).parent.absolute()
-MODELLING_ROOT= os.environ.get("MODELLING_ROOT", str(SCRIPT_DIR / "_MODELLING_STABLE"))
+MODELLING_ROOT= os.environ.get("MODELLING_ROOT", str(SCRIPT_DIR / "_MODELLING"))
 DEVICE        = torch.device("cpu")   # Streamlit Cloud is CPU-only
 EMB_DIM       = 512
 
@@ -199,25 +199,63 @@ def load_all_models(mod_root: str):
         out["scaler_emb"]  = joblib.load(se_path)
 
     # ── embedder ──────────────────────────────────────────────────────────────
-    # Load architecture without pretrained weights (we'll load saved weights)
+    # EmbedderResNet34 wraps ResNet34 layers inside conv_base (nn.Sequential),
+    # so the state-dict keys differ from a stock ResNet34:
+    #   ResNet34 key          →  EmbedderResNet34 key
+    #   conv1.*               →  conv_base.0.*
+    #   bn1.*                 →  conv_base.1.*
+    #   layer1.*              →  conv_base.4.*
+    #   layer2.*              →  conv_base.5.*
+    #   layer3.*              →  conv_base.6.*
+    #   layer4.*              →  conv_base.7.*
+    # relu / maxpool have no learnable params (indices 2, 3).
+    # pool (avgpool) and proj are handled separately.
+    # Using load_state_dict(strict=False) on the raw ResNet34 state_dict
+    # silently skips ALL keys because none match — leaving the embedder
+    # randomly initialised, which causes every image to produce the same
+    # embedding and always predict the same class.  The fix below remaps
+    # every key explicitly before loading.
     embedder = EmbedderResNet34(emb_dim=EMB_DIM, pretrained=False).to(DEVICE)
-    # The embedder has no separate .pth — it was used as a frozen feature
-    # extractor; its pretrained ResNet34 weights are baked in at training time.
-    # We load pretrained weights here to replicate inference exactly.
+    emb_loaded = False
     try:
         from torchvision import models as tvm
-        base       = tvm.resnet34(pretrained=True)
-        state_dict = {
-            "conv_base.0.weight": base.conv1.weight,
-            "conv_base.1.weight": base.bn1.weight,
-            "conv_base.1.bias"  : base.bn1.bias,
-            "conv_base.1.running_mean": base.bn1.running_mean,
-            "conv_base.1.running_var" : base.bn1.running_var,
+        base = tvm.resnet34(pretrained=True)
+        src  = base.state_dict()
+
+        # Prefix map: ResNet34 module name → conv_base child index
+        prefix_map = {
+            "conv1.":  "conv_base.0.",
+            "bn1.":    "conv_base.1.",
+            "layer1.": "conv_base.4.",
+            "layer2.": "conv_base.5.",
+            "layer3.": "conv_base.6.",
+            "layer4.": "conv_base.7.",
         }
-        # Layer-by-layer copy via sequential transfer
-        embedder.load_state_dict(base.state_dict(), strict=False)
-    except Exception:
-        pass
+        remapped = {}
+        for k, v in src.items():
+            for src_pfx, dst_pfx in prefix_map.items():
+                if k.startswith(src_pfx):
+                    remapped[dst_pfx + k[len(src_pfx):]] = v
+                    break
+            # avgpool has no parameters; fc / num_batches_tracked are unused
+
+        missing, unexpected = embedder.load_state_dict(remapped, strict=False)
+        # Only proj.* keys should be missing (randomly initialised head —
+        # proj was also randomly initialised at training time since the
+        # embedder was always called inside torch.no_grad()).
+        proj_only = all(k.startswith("proj.") for k in missing)
+        emb_loaded = proj_only
+        if not proj_only:
+            st.sidebar.warning(
+                f"Embedder: unexpected missing keys: {missing[:5]}")
+    except Exception as e:
+        st.sidebar.warning(f"Embedder pretrained load failed: {e}")
+
+    if emb_loaded:
+        st.sidebar.success("✅ Embedder weights loaded (ResNet34 pretrained)")
+    else:
+        st.sidebar.warning("⚠️ Embedder using random weights — predictions may be wrong")
+
     embedder.eval()
     out["embedder"] = embedder
 
@@ -267,15 +305,39 @@ def load_all_models(mod_root: str):
             st.sidebar.warning(f"DQN load failed: {e}")
 
     # ── YOLO (optional) ───────────────────────────────────────────────────────
+    # Priority order: known names first, then any .pt file found in the folder.
     if YOLO_OK:
-        for candidate in ["yolov12x-cls.pt", "yolov12x.pt", "yolo.pt"]:
+        priority = ["yolov12x-cls.pt", "yolov12x.pt", "yolo.pt"]
+        # Also scan the directory for any .pt file not in the priority list
+        try:
+            all_pts = [
+                f for f in os.listdir(mod_root)
+                if f.endswith(".pt") and f not in priority
+            ]
+        except Exception:
+            all_pts = []
+        candidates = priority + sorted(all_pts)
+
+        yolo_loaded = False
+        for candidate in candidates:
             yp = os.path.join(mod_root, candidate)
             if os.path.exists(yp):
                 try:
                     out["yolo"] = YOLO(yp)
+                    st.sidebar.success(f"✅ YOLO loaded: {candidate}")
+                    yolo_loaded = True
                     break
                 except Exception as e:
                     st.sidebar.warning(f"YOLO load failed ({candidate}): {e}")
+        if not yolo_loaded:
+            found = [f for f in (os.listdir(mod_root) if os.path.isdir(mod_root) else [])
+                     if f.endswith(".pt")]
+            if found:
+                st.sidebar.info(f"YOLO .pt files found but failed to load: {found}")
+            else:
+                st.sidebar.info(
+                    "No .pt file found in MODELLING_ROOT — YOLO unavailable. "
+                    "Place yolov12x-cls.pt inside the _MODELLING folder.")
 
     return out
 
