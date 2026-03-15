@@ -57,7 +57,7 @@ st.set_page_config(
 )
 
 SCRIPT_DIR    = Path(__file__).parent.absolute()
-MODELLING_ROOT= os.environ.get("MODELLING_ROOT", str(SCRIPT_DIR / "_MODELLING"))
+MODELLING_ROOT= os.environ.get("MODELLING_ROOT", str(SCRIPT_DIR / "_MODELLING_STABLE"))
 DEVICE        = torch.device("cpu")   # Streamlit Cloud is CPU-only
 EMB_DIM       = 512
 
