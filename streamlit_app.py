@@ -108,25 +108,34 @@ if TORCH_OK:
         return max(1, g)
 
     class StableDQNNet(nn.Module):
-        """Just the .net part of StableDQNAgent — enough for inference."""
+        """
+        Mirrors StableDQNAgent.net exactly.
+
+        The training script saves:
+            torch.save(agent.net.state_dict(), AGENT_STATE)
+        where agent.net is a bare nn.Sequential, so state-dict keys are
+        flat: "0.weight", "2.weight", "4.weight", ...
+        We register the Sequential as self.seq and load with a prefix remap
+        so both flat keys and "seq.*" keys are accepted.
+        """
         def __init__(self, obs_dim, n_actions, hidden=512):
             super().__init__()
             g1 = _gn_groups(hidden)
             g2 = _gn_groups(max(1, hidden // 2))
-            self.net = nn.Sequential(
+            self.seq = nn.Sequential(
                 nn.Linear(obs_dim, hidden), nn.ReLU(),
                 nn.GroupNorm(g1, hidden), nn.Dropout(0.2),
-                nn.Linear(hidden, max(1, hidden//2)), nn.ReLU(),
-                nn.GroupNorm(g2, max(1, hidden//2)), nn.Dropout(0.2),
-                nn.Linear(max(1, hidden//2), n_actions))
+                nn.Linear(hidden, max(1, hidden // 2)), nn.ReLU(),
+                nn.GroupNorm(g2, max(1, hidden // 2)), nn.Dropout(0.2),
+                nn.Linear(max(1, hidden // 2), n_actions))
 
-        def forward(self, x): return self.net(x)
+        def forward(self, x): return self.seq(x)
 
         def act(self, obs: np.ndarray) -> int:
             self.eval()
             with torch.no_grad():
                 t = torch.from_numpy(obs.astype(np.float32)).unsqueeze(0)
-                q = self.net(t)[0].cpu().numpy()
+                q = self.seq(t)[0].cpu().numpy()
             return int(np.argmax(q))
 
 # =============================================================================
@@ -239,7 +248,19 @@ def load_all_models(mod_root: str):
     if os.path.exists(dqn_path):
         try:
             dqn = StableDQNNet(obs_dim=obs_dim, n_actions=num_classes)
-            dqn.load_state_dict(torch.load(dqn_path, map_location=DEVICE))
+            raw_sd = torch.load(dqn_path, map_location=DEVICE)
+            # The training script saves agent.net.state_dict() which is a
+            # bare Sequential → flat keys "0.weight", "2.weight", etc.
+            # Remap to "seq.*" to match StableDQNNet.seq.
+            if any(k.startswith("seq.") for k in raw_sd):
+                remapped = raw_sd          # already correct prefix
+            elif any(k.startswith("net.") for k in raw_sd):
+                # old wrapper style → strip "net." prefix then add "seq."
+                remapped = {"seq." + k[4:]: v for k, v in raw_sd.items()}
+            else:
+                # flat keys "0.weight" → prefix with "seq."
+                remapped = {"seq." + k: v for k, v in raw_sd.items()}
+            dqn.load_state_dict(remapped)
             dqn.eval()
             out["dqn"] = dqn
         except Exception as e:
@@ -333,7 +354,7 @@ def run_dqn_decision(models: dict, pil_img: Image.Image) -> Optional[Tuple[int, 
     dqn.eval()
     with torch.no_grad():
         t = torch.from_numpy(obs).unsqueeze(0)
-        q_values = dqn.net(t).squeeze(0).cpu().numpy()
+        q_values = dqn.seq(t).squeeze(0).cpu().numpy()
     action = int(np.argmax(q_values))
     return action, float(q_values[action])
 
@@ -438,7 +459,7 @@ def main():
     if not ready:
         st.error("Core model files missing. "
                  "Place `classifier_full.pth` / `classifier_emb.pth`, "
-                 "`scaler_*.joblib`, and `metadata.json` inside `_MODELLING_STABLE/`.")
+                 "`scaler_*.joblib`, and `metadata.json` inside `_MODELLING/`.")
         st.stop()
 
     # ── Upload ────────────────────────────────────────────────────────────────
