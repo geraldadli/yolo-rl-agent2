@@ -1,0 +1,4 @@
+backbone,n_val,accuracy,macro_prec,macro_rec,macro_f1,note
+ResNet34,182,0.7912,0.8035,0.7905,0.7749,
+VGG16,182,0.533,0.5229,0.5357,0.5122,
+ConvNeXt-V2-T,182,0.8022,0.8252,0.8016,0.794,
